@@ -61,7 +61,7 @@ sed -i '/^#\?MaxAuthTries /d' "$SSHD_CONFIG"
 echo "MaxAuthTries 4" >> "$SSHD_CONFIG"
 
 # Проверка конфига перед перезапуском
-sshd -t || die "Ошибка в sshd_config! Откатываю бэкап..."
+sshd -t 2>/dev/null || /usr/sbin/sshd -t || die "Ошибка в sshd_config! Откатываю бэкап..."
 success "sshd_config валиден"
 
 # =============================================================================
@@ -128,8 +128,8 @@ success "fail2ban jail настроен: maxretry=$FAIL2BAN_MAXRETRY, bantime=${
 # =============================================================================
 info "Перезапуск сервисов..."
 
-systemctl restart sshd
-success "sshd перезапущен на порту $SSH_PORT"
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || die "Не удалось перезапустить SSH сервис"
+success "SSH перезапущен на порту $SSH_PORT"
 
 systemctl enable fail2ban --quiet
 systemctl restart fail2ban
