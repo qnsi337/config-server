@@ -54,8 +54,6 @@ sed -i '/^#\?Port /d' "$SSHD_CONFIG"
 echo "Port $SSH_PORT" >> "$SSHD_CONFIG"
 
 # Дополнительные базовые харденинги
-sed -i '/^#\?PermitRootLogin /d' "$SSHD_CONFIG"
-echo "PermitRootLogin prohibit-password" >> "$SSHD_CONFIG"
 
 sed -i '/^#\?MaxAuthTries /d' "$SSHD_CONFIG"
 echo "MaxAuthTries 4" >> "$SSHD_CONFIG"
