@@ -4,7 +4,7 @@
 # Меняет SSH порт на 2224, открывает его в firewall, ставит fail2ban
 # Поддерживаемые системы: Debian 10/11/12/13, Ubuntu 20.04/22.04/24.04,
 #                          RHEL/CentOS/Rocky/AlmaLinux 8/9, Fedora
-# Использование: curl -fsSL <URL> | sudo bash
+# Использование: curl -fsSL https://raw.githubusercontent.com/qnsi337/config-server/main/setup-ssh-security.sh | bash
 # =============================================================================
 
 set -euo pipefail
