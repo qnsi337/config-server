@@ -99,6 +99,41 @@ echo -e "${BOLD}========================================${NC}"
 echo ""
 
 # =============================================================================
+# 0.5. Локали (убирает "locale: Cannot set LC_CTYPE/LC_ALL to default locale")
+# =============================================================================
+info "Проверка локалей..."
+
+if ! locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then
+    case "$PKG_FAMILY" in
+        debian)
+            install_pkg locales >/dev/null 2>&1 || true
+            if [[ -f /etc/locale.gen ]]; then
+                sed -i 's/^# *\(en_US\.UTF-8 UTF-8\)/\1/' /etc/locale.gen
+                grep -q '^en_US\.UTF-8 UTF-8' /etc/locale.gen || echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen
+            fi
+            locale-gen en_US.UTF-8 >/dev/null 2>&1 || true
+            update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 >/dev/null 2>&1 || true
+            ;;
+        rhel)
+            install_pkg glibc-langpack-en >/dev/null 2>&1 || true
+            localectl set-locale LANG=en_US.UTF-8 >/dev/null 2>&1 || true
+            ;;
+    esac
+
+    if locale -a 2>/dev/null | grep -qi '^en_US\.utf8$'; then
+        success "Локаль en_US.UTF-8 сгенерирована"
+    else
+        warn "Не удалось сгенерировать локаль автоматически — предупреждения perl/locale могут остаться (не влияет на работу SSH/fail2ban)"
+    fi
+else
+    success "Локаль en_US.UTF-8 уже есть"
+fi
+
+# Подхватываем для остального скрипта (не обязательно, но убирает warning прямо сейчас)
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+
+# =============================================================================
 # 1. SSH — меняем порт
 # =============================================================================
 info "Настройка SSH (порт $SSH_PORT)..."
