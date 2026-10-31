@@ -158,6 +158,19 @@ echo "Port $SSH_PORT" >> "$SSHD_CONFIG"
 sed -i '/^#\?MaxAuthTries /d' "$SSHD_CONFIG"
 echo "MaxAuthTries 4" >> "$SSHD_CONFIG"
 
+# Отключаем приём LANG/LC_* от клиента. По умолчанию sshd принимает их
+# (AcceptEnv LANG LC_*), и некоторые клиенты (например, macOS Terminal/iTerm)
+# шлют невалидные значения вроде LC_CTYPE=UTF-8 (без языка, не настоящая
+# локаль) — это вызывает "setlocale: LC_CTYPE: cannot change locale" при
+# каждом логине. С выключенным AcceptEnv сервер всегда использует свою
+# локаль (которую мы настроили на шаге 0.5), независимо от клиента.
+sed -i '/^#\?AcceptEnv /d' "$SSHD_CONFIG"
+# На некоторых образах AcceptEnv может быть и в drop-in конфигах
+if [[ -d /etc/ssh/sshd_config.d ]]; then
+    sed -i '/^#\?AcceptEnv /d' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+fi
+success "AcceptEnv LANG/LC_* отключён — локаль больше не будет переопределяться клиентом"
+
 # RHEL-семейство с SELinux: порт нужно явно разрешить в политике,
 # иначе sshd не сможет забиндиться на нестандартный порт
 if [[ "$PKG_FAMILY" == "rhel" ]] && command -v semanage &>/dev/null; then
@@ -299,6 +312,7 @@ if [[ "$FIREWALL_RESTRICTED" -eq 0 ]]; then
             echo "y" | ufw enable >/dev/null
             success "UFW развёрнут: deny incoming по умолчанию, открыты порты: $ALLOWED_PORTS/tcp"
             ufw status verbose
+            FIREWALL_RESTRICTED=1
             ;;
         rhel)
             install_pkg firewalld
@@ -310,6 +324,7 @@ if [[ "$FIREWALL_RESTRICTED" -eq 0 ]]; then
             firewall-cmd --reload >/dev/null
             success "firewalld развёрнут (политика public-зоны по умолчанию — deny), открыты порты: $ALLOWED_PORTS/tcp"
             firewall-cmd --list-all
+            FIREWALL_RESTRICTED=1
             ;;
         *)
             warn "Не знаю, как развернуть firewall для этого семейства ОС. Открой порты вручную: $ALLOWED_PORTS/tcp"
