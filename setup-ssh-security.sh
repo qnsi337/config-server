@@ -4,7 +4,7 @@
 # Меняет SSH порт на 2224, открывает его в firewall, ставит fail2ban
 # Поддерживаемые системы: Debian 10/11/12/13, Ubuntu 20.04/22.04/24.04,
 #                          RHEL/CentOS/Rocky/AlmaLinux 8/9, Fedora
-# Использование: curl -fsSL https://raw.githubusercontent.com/qnsi337/config-server/main/setup-ssh-security.sh | bash
+# Использование: curl -fsSL <URL> | sudo bash
 # =============================================================================
 
 set -euo pipefail
@@ -133,8 +133,45 @@ sshd -t 2>/dev/null || /usr/sbin/sshd -t || die "Ошибка в sshd_config! П
 success "sshd_config валиден"
 
 # =============================================================================
-# 2. Firewall — UFW / firewalld / iptables
+# 2. Обновление ядра (CVE-2026-98432 — use-after-free в обработке IP-опций
+#    TCP SYN/SYNACK, tcp_v4_syn_recv_sock/ireq_opt). Чинится только апдейтом
+#    ядра, никакой sysctl/runtime-митигации для этой уязвимости нет.
 # =============================================================================
+info "Обновление пакета ядра (CVE-2026-98432)..."
+
+KERNEL_BEFORE="$(uname -r)"
+KERNEL_UPDATED=0
+
+case "$PKG_FAMILY" in
+    debian)
+        apt-get update -qq
+        # Метапакет ядра отличается между Debian (linux-image-<arch>) и Ubuntu (linux-image-generic)
+        if apt-cache policy linux-image-amd64 2>/dev/null | grep -q Candidate; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade linux-image-amd64 && KERNEL_UPDATED=1
+        elif apt-cache policy linux-image-generic 2>/dev/null | grep -q Candidate; then
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade linux-image-generic && KERNEL_UPDATED=1
+        else
+            # Фоллбэк — обновляем все установленные linux-image-* пакеты, какие найдутся
+            INSTALLED_KERNELS="$(dpkg-query -W -f='${Package}\n' 'linux-image-*' 2>/dev/null | grep -v '^linux-image-amd64$\|^linux-image-generic$' || true)"
+            if [[ -n "$INSTALLED_KERNELS" ]]; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade $INSTALLED_KERNELS && KERNEL_UPDATED=1
+            fi
+        fi
+        ;;
+    rhel)
+        install_pkg kernel kernel-core kernel-modules 2>/dev/null && KERNEL_UPDATED=1
+        ;;
+esac
+
+if [[ "$KERNEL_UPDATED" -eq 1 ]]; then
+    success "Пакет ядра обновлён (текущее загруженное ядро: $KERNEL_BEFORE)"
+    warn "Патч для CVE-2026-98432 вступит в силу только после перезагрузки (reboot). Без перезагрузки ядро по-прежнему уязвимо!"
+else
+    warn "Не удалось автоматически обновить ядро (возможно, уже последняя версия, либо сетевой репозиторий недоступен). Проверь вручную: uname -r и сверь с fixed-версией для твоего дистрибутива (CVE-2026-98432)."
+fi
+
+# =============================================================================
+# 3. Firewall — UFW / firewalld / iptables
 info "Настройка firewall..."
 
 if command -v ufw &>/dev/null; then
@@ -174,12 +211,45 @@ elif command -v iptables &>/dev/null; then
         iptables-save > /etc/iptables.rules 2>/dev/null || true
     fi
     success "iptables: порт $SSH_PORT открыт"
+
+elif command -v nft &>/dev/null; then
+    # Современный Debian/Ubuntu без ufw/iptables управляет firewall через nftables напрямую
+    RULESET="$(nft list ruleset 2>/dev/null || true)"
+
+    if [[ -z "$RULESET" ]]; then
+        info "nftables установлен, но набор правил пуст — соединения не ограничены, порт $SSH_PORT уже доступен"
+    else
+        # Ищем базовую input-цепочку с политикой drop/reject — только такая цепочка
+        # реально что-то блокирует. Таблицы с policy accept (например, служебная
+        # таблица fail2ban f2b-table, которая только банит отдельные IP) не считаются.
+        DROP_CHAIN_INFO="$(echo "$RULESET" | awk '
+            $1=="table" { fam=$2; tbl=$3 }
+            $1=="chain" { chain=$2 }
+            /hook input/ && /policy (drop|reject)/ { print fam, tbl, chain; exit }
+        ')"
+
+        if [[ -z "$DROP_CHAIN_INFO" ]]; then
+            info "nftables активен, но входящий трафик не блокируется политикой (policy accept) — порт $SSH_PORT уже доступен. Правила fail2ban (если есть) только банят отдельные IP и не ограничивают порт в целом."
+        else
+            NFT_FAMILY="$(echo "$DROP_CHAIN_INFO" | awk '{print $1}')"
+            NFT_TABLE="$(echo "$DROP_CHAIN_INFO" | awk '{print $2}')"
+            NFT_CHAIN="$(echo "$DROP_CHAIN_INFO" | awk '{print $3}')"
+
+            if nft insert rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport "$SSH_PORT" accept 2>/dev/null; then
+                nft delete rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport 22 accept 2>/dev/null || true
+                success "nftables: правило для порта $SSH_PORT добавлено в начало цепочки $NFT_CHAIN ($NFT_FAMILY $NFT_TABLE, policy drop/reject)"
+                warn "Правило не сохранено на диск — сохрани вручную (nft list ruleset > /etc/nftables.conf) или через твой менеджер nftables"
+            else
+                warn "Не удалось автоматически добавить правило в nftables ($NFT_FAMILY $NFT_TABLE $NFT_CHAIN). Открой порт $SSH_PORT вручную!"
+            fi
+        fi
+    fi
 else
     warn "Firewall не обнаружен. Открой порт $SSH_PORT вручную!"
 fi
 
 # =============================================================================
-# 3. fail2ban
+# 4. fail2ban
 # =============================================================================
 info "Установка и настройка fail2ban..."
 
@@ -208,7 +278,7 @@ EOF
 success "fail2ban jail настроен: maxretry=$FAIL2BAN_MAXRETRY, bantime=${FAIL2BAN_BANTIME}s (1 час)"
 
 # =============================================================================
-# 4. Перезапуск сервисов
+# 5. Перезапуск сервисов
 # =============================================================================
 info "Перезапуск сервисов..."
 
@@ -232,9 +302,15 @@ echo -e "${BOLD}${GREEN}========================================${NC}"
 echo ""
 echo -e "  ОС:             ${BOLD}$OS_ID $OS_VERSION${NC}"
 echo -e "  SSH порт:       ${BOLD}$SSH_PORT${NC}"
+echo -e "  Ядро:           ${BOLD}$(uname -r)${NC} $([[ "$KERNEL_UPDATED" -eq 1 ]] && echo "(обновлено, нужен reboot для применения патча CVE-2026-98432)" || echo "(обновление не выполнено — проверь вручную)")"
 echo -e "  fail2ban:       ${BOLD}maxretry=$FAIL2BAN_MAXRETRY, ban=1 час${NC}"
 echo ""
 echo -e "${YELLOW}  ⚠  НЕ закрывай текущую сессию!${NC}"
 echo -e "  Открой новое окно и проверь подключение:"
 echo -e "  ${CYAN}ssh -p $SSH_PORT user@<IP>${NC}"
 echo ""
+if [[ "$KERNEL_UPDATED" -eq 1 ]]; then
+    echo -e "${YELLOW}  ⚠  Ядро обновлено — патч CVE-2026-98432 применится только после перезагрузки (sudo reboot).${NC}"
+    echo -e "  Сначала убедись, что подключение по новому SSH-порту работает, и только потом перезагружай сервер."
+    echo ""
+fi
