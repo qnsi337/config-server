@@ -21,6 +21,11 @@ SSH_PORT=2224
 FAIL2BAN_MAXRETRY=5
 FAIL2BAN_BANTIME=3600  # 1 час в секундах
 
+# TCP-порты, которые должны быть доступны снаружи, помимо SSH.
+# Нужны тут, если скрипту придётся САМОМУ разворачивать firewall с нуля
+# (см. шаг 3) — существующий firewall со своими правилами он не трогает.
+EXTRA_TCP_PORTS="80 443"
+
 info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
 success() { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
@@ -209,22 +214,21 @@ fi
 # 3. Firewall — UFW / firewalld / iptables
 info "Настройка firewall..."
 
-if command -v ufw &>/dev/null; then
-    # Убеждаемся что текущая сессия не потеряется — сначала добавляем новый порт
+# Признак того, что на сервере уже есть РЕАЛЬНО ограничивающий входящий
+# трафик firewall (не просто установленный пакет, а активная deny/reject
+# политика). Если в итоге окажется 0 — ниже сами развернём ufw/firewalld
+# с политикой deny по умолчанию, иначе сервер открыт для всех портов.
+FIREWALL_RESTRICTED=0
+
+if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
+    # UFW уже активен — просто переносим правило с 22 на новый порт
     ufw allow "$SSH_PORT/tcp" comment "SSH custom port" >/dev/null
-
-    # Включаем UFW если выключен (не блокируя текущее соединение на 22)
-    if ! ufw status | grep -q "Status: active"; then
-        ufw allow 22/tcp >/dev/null 2>&1 || true  # временно, удалим ниже
-        echo "y" | ufw enable >/dev/null
-    fi
-
-    # Удаляем старый порт 22 (если был явно открыт)
     ufw delete allow 22/tcp >/dev/null 2>&1 || true
     ufw delete allow ssh >/dev/null 2>&1 || true
 
     success "UFW: порт $SSH_PORT открыт, порт 22 закрыт"
     ufw status | grep -E "$SSH_PORT|22" || true
+    FIREWALL_RESTRICTED=1
 
 elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
     firewall-cmd --permanent --add-port="$SSH_PORT/tcp" >/dev/null
@@ -234,53 +238,83 @@ elif command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewall
 
     success "firewalld: порт $SSH_PORT открыт, порт 22 закрыт"
     firewall-cmd --list-ports
+    FIREWALL_RESTRICTED=1
 
-elif command -v iptables &>/dev/null; then
+elif command -v iptables &>/dev/null && iptables -L INPUT 2>/dev/null | head -1 | grep -qi 'policy DROP\|policy REJECT'; then
+    # iptables с активной deny-политикой на INPUT — реально что-то ограничивает
     iptables -A INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
     iptables -D INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
 
-    # Сохраняем правила (путь отличается между Debian- и RHEL-семейством)
     if command -v iptables-save &>/dev/null; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || \
         iptables-save > /etc/sysconfig/iptables 2>/dev/null || \
         iptables-save > /etc/iptables.rules 2>/dev/null || true
     fi
     success "iptables: порт $SSH_PORT открыт"
+    FIREWALL_RESTRICTED=1
 
-elif command -v nft &>/dev/null; then
+elif command -v nft &>/dev/null && [[ -n "$(nft list ruleset 2>/dev/null)" ]]; then
     # Современный Debian/Ubuntu без ufw/iptables управляет firewall через nftables напрямую
     RULESET="$(nft list ruleset 2>/dev/null || true)"
 
-    if [[ -z "$RULESET" ]]; then
-        info "nftables установлен, но набор правил пуст — соединения не ограничены, порт $SSH_PORT уже доступен"
-    else
-        # Ищем базовую input-цепочку с политикой drop/reject — только такая цепочка
-        # реально что-то блокирует. Таблицы с policy accept (например, служебная
-        # таблица fail2ban f2b-table, которая только банит отдельные IP) не считаются.
-        DROP_CHAIN_INFO="$(echo "$RULESET" | awk '
-            $1=="table" { fam=$2; tbl=$3 }
-            $1=="chain" { chain=$2 }
-            /hook input/ && /policy (drop|reject)/ { print fam, tbl, chain; exit }
-        ')"
+    # Ищем базовую input-цепочку с политикой drop/reject — только такая цепочка
+    # реально что-то блокирует. Таблицы с policy accept (например, служебная
+    # таблица fail2ban f2b-table, которая только банит отдельные IP) не считаются.
+    DROP_CHAIN_INFO="$(echo "$RULESET" | awk '
+        $1=="table" { fam=$2; tbl=$3 }
+        $1=="chain" { chain=$2 }
+        /hook input/ && /policy (drop|reject)/ { print fam, tbl, chain; exit }
+    ')"
 
-        if [[ -z "$DROP_CHAIN_INFO" ]]; then
-            info "nftables активен, но входящий трафик не блокируется политикой (policy accept) — порт $SSH_PORT уже доступен. Правила fail2ban (если есть) только банят отдельные IP и не ограничивают порт в целом."
+    if [[ -n "$DROP_CHAIN_INFO" ]]; then
+        NFT_FAMILY="$(echo "$DROP_CHAIN_INFO" | awk '{print $1}')"
+        NFT_TABLE="$(echo "$DROP_CHAIN_INFO" | awk '{print $2}')"
+        NFT_CHAIN="$(echo "$DROP_CHAIN_INFO" | awk '{print $3}')"
+
+        if nft insert rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport "$SSH_PORT" accept 2>/dev/null; then
+            nft delete rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport 22 accept 2>/dev/null || true
+            success "nftables: правило для порта $SSH_PORT добавлено в начало цепочки $NFT_CHAIN ($NFT_FAMILY $NFT_TABLE, policy drop/reject)"
+            warn "Правило не сохранено на диск — сохрани вручную (nft list ruleset > /etc/nftables.conf) или через твой менеджер nftables"
+            FIREWALL_RESTRICTED=1
         else
-            NFT_FAMILY="$(echo "$DROP_CHAIN_INFO" | awk '{print $1}')"
-            NFT_TABLE="$(echo "$DROP_CHAIN_INFO" | awk '{print $2}')"
-            NFT_CHAIN="$(echo "$DROP_CHAIN_INFO" | awk '{print $3}')"
-
-            if nft insert rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport "$SSH_PORT" accept 2>/dev/null; then
-                nft delete rule "$NFT_FAMILY" "$NFT_TABLE" "$NFT_CHAIN" tcp dport 22 accept 2>/dev/null || true
-                success "nftables: правило для порта $SSH_PORT добавлено в начало цепочки $NFT_CHAIN ($NFT_FAMILY $NFT_TABLE, policy drop/reject)"
-                warn "Правило не сохранено на диск — сохрани вручную (nft list ruleset > /etc/nftables.conf) или через твой менеджер nftables"
-            else
-                warn "Не удалось автоматически добавить правило в nftables ($NFT_FAMILY $NFT_TABLE $NFT_CHAIN). Открой порт $SSH_PORT вручную!"
-            fi
+            warn "Не удалось автоматически добавить правило в nftables ($NFT_FAMILY $NFT_TABLE $NFT_CHAIN)."
         fi
     fi
-else
-    warn "Firewall не обнаружен. Открой порт $SSH_PORT вручную!"
+    # Если DROP_CHAIN_INFO пуст (только permissive-таблицы типа f2b-table) —
+    # FIREWALL_RESTRICTED остаётся 0, ниже развернём ufw/firewalld с нуля.
+fi
+
+if [[ "$FIREWALL_RESTRICTED" -eq 0 ]]; then
+    info "Активного deny-firewall не найдено — разворачиваю его с нуля (deny входящих по умолчанию, открыты только нужные порты)"
+    ALLOWED_PORTS="$SSH_PORT $EXTRA_TCP_PORTS"
+
+    case "$PKG_FAMILY" in
+        debian)
+            install_pkg ufw
+            ufw default deny incoming >/dev/null
+            ufw default allow outgoing >/dev/null
+            for p in $ALLOWED_PORTS; do
+                ufw allow "$p/tcp" >/dev/null
+            done
+            echo "y" | ufw enable >/dev/null
+            success "UFW развёрнут: deny incoming по умолчанию, открыты порты: $ALLOWED_PORTS/tcp"
+            ufw status verbose
+            ;;
+        rhel)
+            install_pkg firewalld
+            systemctl enable --now firewalld --quiet
+            for p in $ALLOWED_PORTS; do
+                firewall-cmd --permanent --add-port="$p/tcp" >/dev/null
+            done
+            firewall-cmd --permanent --remove-service=ssh >/dev/null 2>&1 || true
+            firewall-cmd --reload >/dev/null
+            success "firewalld развёрнут (политика public-зоны по умолчанию — deny), открыты порты: $ALLOWED_PORTS/tcp"
+            firewall-cmd --list-all
+            ;;
+        *)
+            warn "Не знаю, как развернуть firewall для этого семейства ОС. Открой порты вручную: $ALLOWED_PORTS/tcp"
+            ;;
+    esac
 fi
 
 # =============================================================================
@@ -337,6 +371,7 @@ echo -e "${BOLD}${GREEN}========================================${NC}"
 echo ""
 echo -e "  ОС:             ${BOLD}$OS_ID $OS_VERSION${NC}"
 echo -e "  SSH порт:       ${BOLD}$SSH_PORT${NC}"
+echo -e "  Firewall:       ${BOLD}$([[ "$FIREWALL_RESTRICTED" -eq 1 ]] && echo "активен, deny по умолчанию" || echo "НЕ настроен")${NC}"
 echo -e "  Ядро:           ${BOLD}$(uname -r)${NC} $([[ "$KERNEL_UPDATED" -eq 1 ]] && echo "(обновлено, нужен reboot для применения патча CVE-2026-98432)" || echo "(обновление не выполнено — проверь вручную)")"
 echo -e "  fail2ban:       ${BOLD}maxretry=$FAIL2BAN_MAXRETRY, ban=1 час${NC}"
 echo ""
